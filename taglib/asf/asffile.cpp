@@ -475,6 +475,7 @@ void ASF::File::FilePrivate::HeaderExtensionObject::parse(ASF::File *file, long 
       file->setValid(false);
       break;
     }
+    const offset_t childPosition = file->tell();
     BaseObject *obj;
     if(uid == metadataGuid) {
       file->d->metadataObject = new MetadataObject();
@@ -490,6 +491,9 @@ void ASF::File::FilePrivate::HeaderExtensionObject::parse(ASF::File *file, long 
     obj->parse(file, childSize);
     objects.append(obj);
     dataPos += childSize;
+    // The child parser is not guaranteed to consume the whole child object;
+    // continue at the next child object boundary.
+    file->seek(childPosition + childSize - 24);
   }
 }
 
@@ -518,30 +522,44 @@ void ASF::File::FilePrivate::CodecListObject::parse(ASF::File *file, long long s
 
   unsigned int pos = 16;
 
-  const int count = data.toUInt(pos, false);
+  const unsigned int count = data.toUInt(pos, false);
   pos += 4;
 
-  for(int i = 0; i < count; ++i) {
+  for(unsigned int i = 0; i < count; ++i) {
 
-    if(pos >= data.size())
+    // Each entry consists of at least the codec type and three length
+    // fields.  Stop on truncated data instead of iterating an
+    // attacker-controlled count (up to 2^32 - 1) or wrapping pos.
+    if(pos > data.size() || data.size() - pos < 8)
       break;
 
     const auto type = static_cast<CodecType>(data.toUShort(pos, false));
     pos += 2;
 
-    int nameLength = data.toUShort(pos, false);
+    const unsigned int nameLength = data.toUShort(pos, false);
     pos += 2;
+    if(nameLength * 2 > data.size() - pos)
+      break;
 
     const unsigned int namePos = pos;
     pos += nameLength * 2;
 
-    const int descLength = data.toUShort(pos, false);
+    if(data.size() - pos < 2)
+      break;
+    const unsigned int descLength = data.toUShort(pos, false);
     pos += 2;
+    if(descLength * 2 > data.size() - pos)
+      break;
 
     const unsigned int descPos = pos;
     pos += descLength * 2;
 
-    const int infoLength = data.toUShort(pos, false);
+    if(data.size() - pos < 2)
+      break;
+    const unsigned int infoLength = data.toUShort(pos, false);
+    // The codec information is the last field of the entry and pos can
+    // no longer wrap (it is bounded by data.size() above), so this
+    // advance needs no further check.
     pos += 2 + infoLength * 2;
 
     if(type == CodecListObject::Audio) {
@@ -747,6 +765,17 @@ void ASF::File::read()
       setValid(false);
       break;
     }
+    // The object size includes the 24-byte GUID and size fields, and the
+    // object must fit into the header.  Reject truncated, zero-sized,
+    // oversized or wrapping sizes deterministically instead of misparsing
+    // the following data as further objects.
+    const offset_t dataPosition = tell();
+    if(size < 24 ||
+       size - 24 > static_cast<long long>(d->headerSize) - dataPosition) {
+      debug("ASF::File::read(): Invalid object size.");
+      setValid(false);
+      break;
+    }
     FilePrivate::BaseObject *obj;
     if(guid == filePropertiesGuid) {
       filePropertiesObject = new FilePrivate::FilePropertiesObject();
@@ -781,6 +810,13 @@ void ASF::File::read()
     }
     obj->parse(this, size);
     d->objects.append(obj);
+    // The object size is authoritative: some parsers (content description,
+    // metadata, header extension, ...) consume exactly what their internal
+    // structure describes, which may be less than the object (padding) or,
+    // for corrupt objects, more.  Continue at the next object boundary so
+    // that objects such as the extended stream properties object are always
+    // found at the right position.
+    seek(dataPosition + size - 24);
   }
 
   if(!filePropertiesObject || !streamPropertiesObject) {

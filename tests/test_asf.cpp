@@ -28,6 +28,7 @@
 
 #include "tstringlist.h"
 #include "tbytevectorlist.h"
+#include "tbytevectorstream.h"
 #include "tpropertymap.h"
 #include "tag.h"
 #include "asffile.h"
@@ -36,6 +37,138 @@
 
 using namespace std;
 using namespace TagLib;
+
+namespace
+{
+  const ByteVector asfHeaderGuid("\x30\x26\xB2\x75\x8E\x66\xCF\x11\xA6\xD9\x00\xAA\x00\x62\xCE\x6C", 16);
+  const ByteVector asfFilePropertiesGuid("\xA1\xDC\xAB\x8C\x47\xA9\xCF\x11\x8E\xE4\x00\xC0\x0C\x20\x53\x65", 16);
+  const ByteVector asfStreamPropertiesGuid("\x91\x07\xDC\xB7\xB7\xA9\xCF\x11\x8E\xE6\x00\xC0\x0C\x20\x53\x65", 16);
+  const ByteVector asfHeaderExtensionGuid("\xB5\x03\xBF\x5F\x2E\xA9\xCF\x11\x8E\xE3\x00\xC0\x0C\x20\x53\x65", 16);
+  const ByteVector asfMetadataGuid("\xEA\xCB\xF8\xC5\xAF\x5B\x77\x48\x84\x67\xAA\x8C\x44\xFA\x4C\xCA", 16);
+  const ByteVector asfExtStreamPropsGuid("\xCB\xF8\xE6\x14\x25\xC2\x4B\x66\x9A\x65\x54\xF7\xE8\xB6\xD8\x28", 16);
+  const ByteVector asfAudioMediaGuid("\x40\x9E\x69\xF8\x4D\x5B\xCF\x11\xA8\xFD\x00\x80\x5F\x5C\x44\x2B", 16);
+  const ByteVector asfNoErrorCorrectionGuid("\x00\x57\xFB\x20\x00\xEF\xCF\x11\xA6\xD9\x00\xAA\x00\x62\xCE\x6C", 16);
+  const ByteVector asfReserved1Guid("\x11\xD2\xD3\xAB\xBA\xA9\xCF\x11\x8E\xE6\x00\xC0\x0C\x20\x53\x65", 16);
+
+  ByteVector asfObject(const ByteVector &guid, const ByteVector &data)
+  {
+    return guid + ByteVector::fromLongLong(data.size() + 24, false) + data;
+  }
+
+  ByteVector asfHeader(const ByteVectorList &objects)
+  {
+    const ByteVector body = objects.toByteVector("");
+    return asfHeaderGuid +
+           ByteVector::fromLongLong(body.size() + 30, false) +
+           ByteVector::fromUInt(objects.size(), false) +
+           ByteVector("\x01\x02", 2) +
+           body;
+  }
+
+  ByteVector asfUtf16(const char *str)
+  {
+    ByteVector data;
+    for(const char *p = str; *p; ++p) {
+      data.append(*p);
+      data.append('\0');
+    }
+    return data;
+  }
+
+  // playDuration in 100ns units, preroll in ms, as in the file properties object
+  ByteVector filePropertiesObject(long long playDuration, long long preroll)
+  {
+    ByteVector data;
+    data.append(ByteVector(16, '\0'));                 // file ID
+    data.append(ByteVector::fromLongLong(0, false));   // file size
+    data.append(ByteVector::fromLongLong(0, false));   // creation date
+    data.append(ByteVector::fromLongLong(0, false));   // data packets count
+    data.append(ByteVector::fromLongLong(playDuration, false));
+    data.append(ByteVector::fromLongLong(0, false));   // send duration
+    data.append(ByteVector::fromLongLong(preroll, false));
+    data.append(ByteVector::fromUInt(0, false));       // flags
+    data.append(ByteVector::fromUInt(100, false));     // minimum packet size
+    data.append(ByteVector::fromUInt(100, false));     // maximum packet size
+    data.append(ByteVector::fromUInt(0, false));       // maximum bitrate
+    return asfObject(asfFilePropertiesGuid, data);
+  }
+
+  ByteVector streamPropertiesObject()
+  {
+    ByteVector wave;
+    wave.append(ByteVector::fromShort(0x0161, false));   // codec: WMA 3
+    wave.append(ByteVector::fromShort(2, false));        // channels
+    wave.append(ByteVector::fromUInt(44100, false));     // sample rate
+    wave.append(ByteVector::fromUInt(64000, false));     // average bytes/second
+    wave.append(ByteVector::fromShort(4, false));        // block alignment
+    wave.append(ByteVector::fromShort(16, false));       // bits per sample
+
+    ByteVector data;
+    data.append(asfAudioMediaGuid);
+    data.append(asfNoErrorCorrectionGuid);
+    data.append(ByteVector::fromLongLong(0, false));     // time offset
+    data.append(ByteVector::fromUInt(wave.size(), false));
+    data.append(ByteVector::fromUInt(0, false));         // error correction data
+    data.append(ByteVector::fromShort(1, false));        // flags: stream number 1
+    data.append(ByteVector::fromUInt(0, false));         // reserved
+    data.append(wave);
+    return asfObject(asfStreamPropertiesGuid, data);
+  }
+
+  // Extended stream properties object containing one payload extension system
+  ByteVector extendedStreamPropertiesObject()
+  {
+    ByteVector data;
+    data.append(ByteVector::fromLongLong(0, false));     // start time
+    data.append(ByteVector::fromLongLong(0, false));     // end time
+    data.append(ByteVector::fromUInt(128000, false));    // data bitrate
+    data.append(ByteVector::fromUInt(4096, false));      // buffer size
+    data.append(ByteVector::fromUInt(0, false));         // initial buffer fullness
+    data.append(ByteVector::fromUInt(128000, false));    // alternate data bitrate
+    data.append(ByteVector::fromUInt(4096, false));      // alternate buffer size
+    data.append(ByteVector::fromUInt(0, false));         // alternate initial buffer fullness
+    data.append(ByteVector::fromUInt(100, false));       // maximum object size
+    data.append(ByteVector::fromUInt(0, false));         // flags
+    data.append(ByteVector::fromShort(1, false));        // stream number
+    data.append(ByteVector::fromShort(0, false));        // stream language ID index
+    data.append(ByteVector::fromLongLong(0, false));     // average time per frame
+    data.append(ByteVector::fromShort(0, false));        // stream name count
+    data.append(ByteVector::fromShort(1, false));        // payload extension system count
+    // payload extension system: extension system ID, data size, info
+    data.append(ByteVector("\xC6\xBD\x94\x50\x86\x7F\x49\x07\x83\xA3\xC9\x69\x21\xB7\x33\xAD", 16));
+    data.append(ByteVector::fromShort(4, false));
+    data.append(ByteVector("\x01\x02\x03\x04", 4));
+    return asfObject(asfExtStreamPropsGuid, data);
+  }
+
+  ByteVector metadataObject()
+  {
+    const ByteVector name  = asfUtf16("WM/AlbumArtist") + ByteVector(2, '\0');
+    const ByteVector value = asfUtf16("Someone") + ByteVector(2, '\0');
+    ByteVector record;
+    record.append(ByteVector::fromShort(0, false));      // language ID
+    record.append(ByteVector::fromShort(0, false));      // stream number
+    record.append(ByteVector::fromShort(name.size(), false));
+    record.append(ByteVector::fromShort(0, false));      // type: Unicode string
+    record.append(ByteVector::fromUInt(value.size(), false));
+    record.append(name);
+    record.append(value);
+    return asfObject(asfMetadataGuid, ByteVector::fromShort(1, false) + record);
+  }
+
+  // Header extension object holding child, followed by padding bytes which
+  // are covered by the object size but not by the extension data size.
+  ByteVector headerExtensionObject(const ByteVector &child, int padding)
+  {
+    ByteVector data;
+    data.append(asfReserved1Guid);
+    data.append(ByteVector("\x06\x00", 2));
+    data.append(ByteVector::fromUInt(child.size(), false));
+    data.append(child);
+    data.append(ByteVector(padding, '\0'));
+    return asfObject(asfHeaderExtensionGuid, data);
+  }
+}  // namespace
 
 class TestASF : public CppUnit::TestFixture
 {
@@ -58,6 +191,8 @@ class TestASF : public CppUnit::TestFixture
   CPPUNIT_TEST(testRatingWma);
   CPPUNIT_TEST(testCaseInsensitiveAttributeNames);
   CPPUNIT_TEST(testRepeatedSave);
+  CPPUNIT_TEST(testExtendedStreamProperties);
+  CPPUNIT_TEST(testInvalidObjectSize);
   CPPUNIT_TEST_SUITE_END();
 
 public:
@@ -730,6 +865,95 @@ public:
     f.tag()->setTitle(longText(16 * 1024));
     f.save();
     CPPUNIT_ASSERT_EQUAL(static_cast<offset_t>(68202), f.length());
+  }
+
+  void testExtendedStreamProperties()
+  {
+    // A header containing an extended stream properties object (with a
+    // payload extension system) and a padded header extension object.
+    // The objects have to be traversed by their object size, so that the
+    // stream properties object behind them is still found.
+    ByteVectorList objects;
+    objects.append(filePropertiesObject(123456780000LL, 2000));
+    objects.append(extendedStreamPropertiesObject());
+    objects.append(headerExtensionObject(metadataObject(), 32));
+    objects.append(streamPropertiesObject());
+
+    ByteVectorStream stream(asfHeader(objects));
+    ASF::File f(&stream);
+    CPPUNIT_ASSERT(f.isValid());
+    CPPUNIT_ASSERT(f.audioProperties());
+    // play duration 123456780000 * 100ns = 12345678 ms, minus 2000 ms preroll
+    CPPUNIT_ASSERT_EQUAL(12343678, f.audioProperties()->lengthInMilliseconds());
+    // 64000 bytes/s = 512 kbps
+    CPPUNIT_ASSERT_EQUAL(512, f.audioProperties()->bitrate());
+    CPPUNIT_ASSERT_EQUAL(2, f.audioProperties()->channels());
+    CPPUNIT_ASSERT_EQUAL(44100, f.audioProperties()->sampleRate());
+    CPPUNIT_ASSERT_EQUAL(16, f.audioProperties()->bitsPerSample());
+    // attribute from the metadata object inside the header extension
+    CPPUNIT_ASSERT(f.tag()->contains("WM/AlbumArtist"));
+    CPPUNIT_ASSERT_EQUAL(String("Someone"),
+      f.tag()->attribute("WM/AlbumArtist").front().toString());
+  }
+
+  void testInvalidObjectSize()
+  {
+    // A zero-sized object after the mandatory objects: the parse has to
+    // fail deterministically instead of silently accepting the file.
+    {
+      ByteVectorList objects;
+      objects.append(filePropertiesObject(123456780000LL, 2000));
+      objects.append(streamPropertiesObject());
+      objects.append(asfExtStreamPropsGuid + ByteVector::fromLongLong(0, false));
+
+      ByteVectorStream stream(asfHeader(objects));
+      ASF::File f(&stream);
+      CPPUNIT_ASSERT(!f.isValid());
+    }
+    // An object size smaller than the 24-byte object header.
+    {
+      ByteVectorList objects;
+      objects.append(filePropertiesObject(123456780000LL, 2000));
+      objects.append(asfExtStreamPropsGuid + ByteVector::fromLongLong(16, false));
+
+      ByteVectorStream stream(asfHeader(objects));
+      ASF::File f(&stream);
+      CPPUNIT_ASSERT(!f.isValid());
+    }
+    // An object size extending beyond the end of the header.
+    {
+      ByteVectorList objects;
+      objects.append(filePropertiesObject(123456780000LL, 2000));
+      objects.append(asfExtStreamPropsGuid +
+                     ByteVector::fromLongLong(0x100000, false) +
+                     ByteVector(64, '\0'));
+
+      ByteVectorStream stream(asfHeader(objects));
+      ASF::File f(&stream);
+      CPPUNIT_ASSERT(!f.isValid());
+    }
+    // An object size of 2^64 - 1, wrapping any offset computation.
+    {
+      ByteVectorList objects;
+      objects.append(filePropertiesObject(123456780000LL, 2000));
+      objects.append(asfExtStreamPropsGuid + ByteVector::fromLongLong(-1, false));
+
+      ByteVectorStream stream(asfHeader(objects));
+      ASF::File f(&stream);
+      CPPUNIT_ASSERT(!f.isValid());
+    }
+    // A zero-sized child object inside the header extension.
+    {
+      ByteVectorList objects;
+      objects.append(filePropertiesObject(123456780000LL, 2000));
+      objects.append(streamPropertiesObject());
+      objects.append(headerExtensionObject(
+        asfMetadataGuid + ByteVector::fromLongLong(0, false), 0));
+
+      ByteVectorStream stream(asfHeader(objects));
+      ASF::File f(&stream);
+      CPPUNIT_ASSERT(!f.isValid());
+    }
   }
 
 };

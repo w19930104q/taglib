@@ -180,6 +180,9 @@ IF(BUILD_BINDINGS)
 ENDIF()
 
 ADD_TEST(test_runner test_runner)
+# Malformed-input tests (e.g. corrupt ASF object sizes) must terminate
+# deterministically; fail the suite if anything hangs.
+SET_TESTS_PROPERTIES(test_runner PROPERTIES TIMEOUT 120)
 
 # Thread safety tests cover state which is lazily initialized once per process,
 # so they have to run before anything else has touched it
